@@ -14,9 +14,9 @@ import io # Used in utils for generating tsv/csv in memory
 from flask import Flask, request, render_template, redirect, url_for, flash, send_file, Response
 
 # Import our custom modules
-from clients import ClaudeClient, GeminiClient, OpenAIClient # Handles talking to different LLMs
+from LLM_webapp.clients import ClaudeClient, GeminiClient, OpenAIClient # Handles talking to different LLMs
 # Import all our helper functions for file processing and saving
-from utils import (
+from LLM_webapp.utils import (
     extract_text_from_docx,
     extract_text_from_pptx,
     extract_text_from_pdf, # Added PDF extractor

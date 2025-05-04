@@ -8,7 +8,7 @@ import requests
 import json 
 import os 
 
-from clients import ClaudeClient, GeminiClient, OpenAIClient 
+from LLM_webapp.clients import ClaudeClient, GeminiClient, OpenAIClient 
 from utils import (
     extract_text_from_docx,
     extract_text_from_pptx,
