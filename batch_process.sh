@@ -4,7 +4,7 @@
 # set -e # Keep disabled to allow skipping and error reporting per file
 
 # --- Configuration ---
-INPUT_DIR="/mnt/c/Users/julih/Downloads/KVFD_EMT_PPTs/_Powerpoints" # Adjust if needed
+INPUT_DIR="Powerpoints" # Adjust if needed
 OUTPUT_DIR="./anki_decks" # Creates this directory relative to where script is run
 # Assuming cli.py is now the entry point for CLI operations
 APP_SCRIPT_PATH="./cli.py" # Use the updated cli.py script
