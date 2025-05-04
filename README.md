@@ -30,4 +30,4 @@ This tool provides both a command-line interface (`doc2deck`) for quick conversi
 You can install the command-line tool directly using pip and git:
 
 ```bash
-pip install git+[https://github.com/yourusername/your-repo-name.git](https://github.com/yourusername/your-repo-name.git)
+pip install git+[https://github.com/raydioactive/doc2deck.git](https://github.com/raydioactive/doc2deck.git)
