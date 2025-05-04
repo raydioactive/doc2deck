@@ -47,6 +47,8 @@
     {% endwith %}
 
     <form method="post">
+        <!-- CSRF Protection -->
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
         <input type="hidden" name="card_count" value="{{ flashcards|length }}">
 
         {% if flashcards %}

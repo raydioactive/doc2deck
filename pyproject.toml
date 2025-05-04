@@ -28,6 +28,8 @@ dependencies = [
     "python-pptx",
     "pypdf",
     "markdown",
+    "tqdm",
+    "cryptography"
 ]
 
 [project.urls]

@@ -1,6 +1,5 @@
 # LLM_webapp/utils.py
 
-
 import docx2txt
 import genanki
 import random
@@ -11,20 +10,28 @@ from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pypdf import PdfReader
 import markdown 
+import re
 
 
 def extract_text_from_pdf(pdf_path: str) -> Optional[str]:
-    """Extract text from PDF using pypdf."""
+    """Extract text from PDF using pypdf with improved robustness."""
     try:
         with open(pdf_path, 'rb') as file:
             reader = PdfReader(file)
             text_parts = []
+            
+            # Process each page
             for page in reader.pages:
-                 page_text = page.extract_text()
-                 if page_text: # Add text only if extraction was successful for the page
-                     text_parts.append(page_text)
-            full_text = "\n".join(text_parts).strip()
-            return full_text if full_text else None # Return None if no text was extracted
+                page_text = page.extract_text()
+                if page_text:
+                    # Basic cleaning
+                    page_text = re.sub(r'\s+', ' ', page_text)  # Normalize whitespace
+                    page_text = re.sub(r'([a-z])-\s+([a-z])', r'\1\2', page_text)  # Fix hyphenation
+                    text_parts.append(page_text)
+            
+            full_text = "\n\n".join(text_parts).strip()
+            return full_text if full_text else None
+            
     except FileNotFoundError:
         # Re-raise FileNotFoundError to be handled by the caller
         raise
@@ -41,31 +48,69 @@ def extract_text_from_docx(file_path: str) -> str:
         raise IOError(f"Failed to extract text from DOCX file: {file_path}. Error: {e}") from e
 
 def extract_text_from_pptx(file_path: str) -> str:
-    """Extract text content from a PPTX file"""
+    """Extract text content from a PPTX file with improved table and chart handling"""
     try:
         prs = Presentation(file_path)
         text_runs = []
-        for slide in prs.slides:
+        
+        # Process each slide
+        for slide_num, slide in enumerate(prs.slides, 1):
+            # Add slide number reference
+            text_runs.append(f"--- Slide {slide_num} ---")
+            
+            # Extract slide title if available
+            if slide.shapes.title:
+                text_runs.append(f"Title: {slide.shapes.title.text}")
+            
+            # Process all shapes
             for shape in slide.shapes:
-                # Basic text extraction from text frames
+                # Text frames
                 if shape.has_text_frame:
+                    shape_text = []
                     for paragraph in shape.text_frame.paragraphs:
-                        for run in paragraph.runs:
-                            text_runs.append(run.text)
-                # Attempt to extract text from tables
+                        shape_text.append(paragraph.text)
+                    if shape_text:
+                        text_runs.append("\n".join(shape_text))
+                
+                # Tables with improved extraction
                 if shape.has_table:
+                    table_rows = []
                     for row in shape.table.rows:
+                        row_cells = []
                         for cell in row.cells:
-                             # Check if cell has text_frame (safer)
-                             if cell.text_frame:
-                                text_runs.append(cell.text_frame.text)
-                # Attempt extraction from chart titles/data (more complex, basic example)
-                # Note: Extracting detailed chart data requires more specific handling
-                if shape.has_chart and shape.shape_type == MSO_SHAPE_TYPE.CHART:
-                     if shape.chart.has_title:
-                         text_runs.append(shape.chart.chart_title.text_frame.text)
+                            if cell.text_frame:
+                                row_cells.append(cell.text_frame.text.strip())
+                            else:
+                                row_cells.append("")
+                        table_rows.append(" | ".join(row_cells))
+                    if table_rows:
+                        text_runs.append("Table:\n" + "\n".join(table_rows))
+                
+                # Charts with more detailed extraction
+                if hasattr(shape, 'chart'):
+                    try:
+                        chart_text = ["Chart:"]
+                        
+                        # Get chart title
+                        if shape.chart.has_title:
+                            chart_text.append(f"Title: {shape.chart.chart_title.text_frame.text}")
+                        
+                        # Extract category labels if possible
+                        if hasattr(shape.chart, 'plots') and shape.chart.plots:
+                            for plot in shape.chart.plots:
+                                if hasattr(plot, 'categories') and plot.categories:
+                                    categories = []
+                                    for cat in plot.categories:
+                                        if cat:
+                                            categories.append(str(cat))
+                                    if categories:
+                                        chart_text.append(f"Categories: {', '.join(categories)}")
+                        
+                        text_runs.append("\n".join(chart_text))
+                    except Exception as e:
+                        text_runs.append(f"Chart: [Data extraction error: {str(e)}]")
 
-        return "\n".join(text_runs).strip() # Join text with newlines
+        return "\n\n".join(text_runs).strip() # Join text with newlines
     except Exception as e:
         raise IOError(f"Failed to extract text from PPTX file: {file_path}. Error: {e}") from e
 
@@ -198,3 +243,63 @@ def generate_csv_content(flashcards: List[Dict[str, str]]) -> str:
         back = card.get('back', '').strip()
         writer.writerow([front, back])
     return output.getvalue()
+
+def filter_low_quality_cards(cards: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Filter out low-quality flashcards based on various criteria."""
+    filtered_cards = []
+    
+    for card in cards:
+        front = card.get('front', '').strip()
+        back = card.get('back', '').strip()
+        
+        # Skip empty cards
+        if not front or not back:
+            continue
+            
+        # Skip cards with very short answers
+        if len(back) < 10:
+            continue
+            
+        # Skip cards with very similar front/back content
+        if similarity_ratio(front, back) > 0.8:
+            continue
+            
+        # Skip cards with certain problematic patterns
+        if is_problematic_card(front, back):
+            continue
+            
+        filtered_cards.append(card)
+        
+    return filtered_cards
+
+def similarity_ratio(str1: str, str2: str) -> float:
+    """Calculate similarity between two strings using sequence matching."""
+    from difflib import SequenceMatcher
+    return SequenceMatcher(None, str1.lower(), str2.lower()).ratio()
+
+def is_problematic_card(front: str, back: str) -> bool:
+    """Check for common problems in flashcards."""
+    # Front contains the answer (defeats the purpose)
+    if back.strip() in front.strip():
+        return True
+        
+    # Back just repeats the front with minor changes
+    if front.lower().strip() == back.lower().strip():
+        return True
+        
+    # Front is a complete sentence and back is just True/False
+    if len(front) > 30 and back.strip().lower() in ['true', 'false']:
+        return True
+        
+    # Card is just a definition format with no actual content
+    definition_patterns = [
+        r"^Definition of ",
+        r"^Define ",
+        r"^What is the definition of "
+    ]
+    
+    for pattern in definition_patterns:
+        if re.match(pattern, front, re.IGNORECASE) and len(back) < 20:
+            return True
+            
+    return False

@@ -73,6 +73,7 @@ Doc2Deck needs to communicate with an AI service (LLM) to generate flashcards. Y
 * **OpenAI GPT:** Sign up and get an API key from the [OpenAI Platform](https://platform.openai.com/api-keys).
 
 **Important:** Keep your API key secure and private. These services often have associated costs based on usage.
+**quick TBH:** I've only tested this using gemini. I do not know that this works with the openAI/Claude APIs. That would require some more testing, that I think is irrelevant because as of now (5/4/2025) Gemini is best for this use case. Just do google with your free account and it should be fine - I've been testing this for a while and they still haven't charged me anything. 
 
 **4. Install Doc2Deck**
 

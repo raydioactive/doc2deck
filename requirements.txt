@@ -6,3 +6,5 @@ google-genai
 python-pptx
 pypdf
 markdown
+tqdm
+cryptography

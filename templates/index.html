@@ -44,6 +44,9 @@
     {% endwith %}
 
     <form method="post" enctype="multipart/form-data">
+        <!-- CSRF Protection -->
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
+        
         <label for="file">Select DOCX, PPTX, or PDF File(s):</label>
         <input type="file" id="file" name="file"
                accept=".docx,.pptx,.pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.presentationml.presentation,application/pdf"

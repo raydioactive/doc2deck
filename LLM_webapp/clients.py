@@ -1,7 +1,8 @@
 # clients.py
 import requests
 import json
-from typing import List, Dict, Optional
+import time
+from typing import List, Dict, Optional, Tuple, Any, Mapping
 from google import genai  # Updated import for the new SDK
 from google.genai import types  # Import types from new SDK
 
@@ -10,55 +11,233 @@ DEFAULT_GEMINI_MODEL = "gemini-2.5-pro-latest"
 DEFAULT_CLAUDE_MODEL = "claude-3-opus-20240229"
 DEFAULT_OPENAI_MODEL = "gpt-4-turbo"
 
-# Define your consistent, optimized prompt here
-# ESCAPE LITERAL BRACES in the example JSON by using {{ and }}
-FLASHCARD_PROMPT_TEMPLATE = """Create comprehensive Anki flashcards from the following document content.
-Generate question-answer pairs that cover key concepts, definitions, facts, and relationships.
-Focus on creating atomic cards (one main idea per card) for effective learning.
-Format the entire output strictly as a single JSON array of objects, where each object has a "front" key (the question or term) and a "back" key (the answer or definition).
-Example format: [{{"front": "Question 1?", "back": "Answer 1."}}, {{"front": "Term A", "back": "Definition A."}}]
-Ensure the output is only the JSON array, without any introductory text, explanations, or markdown formatting like ```json ... ```.
+# Model context window cache
+MODEL_CONTEXT_CACHE = {}
 
-Document content:
+# Define your consistent, optimized prompt
+FLASHCARD_PROMPT_TEMPLATE = """Create high-quality Anki flashcards from the following document content.
+Focus on the most important concepts for long-term retention.
+
+GUIDELINES:
+1. Create atomic cards (one concept per card)
+2. Front side should contain a clear, specific question or cue
+3. Back side should contain a concise answer without including the question
+4. Favor applied understanding over pure memorization
+5. Include 15-30 cards depending on content density
+
+FORMAT:
+Output must be ONLY a JSON array of objects with "front" and "back" keys.
+Do not include any explanatory text, markdown formatting, or code block syntax.
+
+EXAMPLES OF GOOD CARDS:
+[
+  {{"front": "What is the principle of locality in computer systems?", "back": "The tendency of a processor to access the same set of memory locations repetitively over a short period of time, forming the basis for cache design."}},
+  {{"front": "Symptoms of hyperkalemia", "back": "- Muscle weakness\\n- Paresthesia\\n- ECG changes (peaked T waves, widened QRS)\\n- Cardiac arrhythmias"}},
+  {{"front": "Why is encapsulation important in OOP?", "back": "It protects the internal state of an object by hiding implementation details, reducing dependencies, and providing a controlled interface for interaction."}}
+]
+
+DOCUMENT CONTENT:
 {content}"""
+
+
+def get_model_limits(model_name: str, api_key: str) -> Tuple[int, int]:
+    """
+    Retrieve token limits for a specific model using the Gen AI SDK.
+    Returns (input_token_limit, output_token_limit) tuple.
+    """
+    # Check cache first
+    if model_name in MODEL_CONTEXT_CACHE:
+        return MODEL_CONTEXT_CACHE[model_name]
+    
+    # Provider-specific limit retrieval
+    if model_name.startswith("gemini"):
+        return _get_gemini_limits(model_name, api_key)
+    elif model_name.startswith("claude"):
+        return _get_claude_limits(model_name)
+    elif "gpt" in model_name:
+        return _get_openai_limits(model_name)
+    else:
+        # Default conservative limits
+        return (4096, 4096)
+
+def _get_gemini_limits(model_name: str, api_key: str) -> Tuple[int, int]:
+    """Get limits for Gemini models using the SDK."""
+    try:
+        # Initialize client
+        client = genai.Client(api_key=api_key)
+        
+        # List models to find the specified one
+        for model in client.models.list():
+            if model.name.endswith(model_name) or model_name in model.name:
+                # Extract limits from model metadata
+                input_token_limit = getattr(model, "input_token_limit", 30720)
+                output_token_limit = getattr(model, "output_token_limit", 4096)
+                
+                # Cache the result
+                MODEL_CONTEXT_CACHE[model_name] = (input_token_limit, output_token_limit)
+                return (input_token_limit, output_token_limit)
+        
+        # Model not found in the list, use defaults based on known models
+        if "gemini-1.5" in model_name:
+            limits = (1000000, 8192)  # ~1M token context for Gemini 1.5
+        elif "gemini-2.5" in model_name:
+            limits = (1000000, 8192)  # ~1M token context for Gemini 2.5
+        else:
+            limits = (30720, 4096)    # Default for older models
+            
+        MODEL_CONTEXT_CACHE[model_name] = limits
+        return limits
+    except Exception as e:
+        # Fall back to conservative defaults if API call fails
+        print(f"Warning: Error retrieving Gemini model limits: {e}")
+        limits = (30720, 4096)  # Conservative default
+        MODEL_CONTEXT_CACHE[model_name] = limits
+        return limits
+
+def _get_claude_limits(model_name: str) -> Tuple[int, int]:
+    """Get limits for Claude models based on known specifications."""
+    if "claude-3-opus" in model_name:
+        limits = (200000, 4096)
+    elif "claude-3-sonnet" in model_name:
+        limits = (200000, 4096)
+    elif "claude-3-haiku" in model_name:
+        limits = (150000, 4096)
+    else:
+        limits = (100000, 4096)  # Conservative default
+    
+    MODEL_CONTEXT_CACHE[model_name] = limits
+    return limits
+
+def _get_openai_limits(model_name: str) -> Tuple[int, int]:
+    """Get limits for OpenAI models based on known specifications."""
+    if "gpt-4-turbo" in model_name:
+        limits = (128000, 4096)
+    elif "gpt-4o" in model_name:
+        limits = (128000, 4096)
+    elif "gpt-3.5-turbo" in model_name:
+        limits = (16385, 4096)
+    else:
+        limits = (8192, 4096)  # Conservative default
+    
+    MODEL_CONTEXT_CACHE[model_name] = limits
+    return limits
+
+
+def estimate_tokens_from_chars(text: str) -> int:
+    """Estimate token count from character count using conservative ratio."""
+    # Most tokenizers average 4-6 chars per token
+    # Using 4 for a conservative estimate
+    return len(text) // 4
+
+
+def chunk_content(content: str, max_chunk_size: int) -> List[str]:
+    """Split content into chunks based on token limits."""
+    if estimate_tokens_from_chars(content) <= max_chunk_size:
+        return [content]
+    
+    # Simple paragraph-based chunking
+    paragraphs = content.split('\n\n')
+    chunks = []
+    current_chunk = ""
+    
+    for para in paragraphs:
+        para_tokens = estimate_tokens_from_chars(para)
+        current_chunk_tokens = estimate_tokens_from_chars(current_chunk)
+        
+        if current_chunk_tokens + para_tokens + 2 <= max_chunk_size:
+            current_chunk += (para + "\n\n")
+        else:
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+            current_chunk = para + "\n\n"
+            
+            # Handle paragraphs that exceed chunk size individually
+            if para_tokens > max_chunk_size:
+                # Split by sentences if a paragraph is too large
+                sentences = para.split('. ')
+                sentence_chunk = ""
+                
+                for sentence in sentences:
+                    if estimate_tokens_from_chars(sentence_chunk + sentence + '. ') <= max_chunk_size:
+                        sentence_chunk += sentence + '. '
+                    else:
+                        if sentence_chunk:
+                            chunks.append(sentence_chunk.strip())
+                        sentence_chunk = sentence + '. '
+                
+                if sentence_chunk:
+                    current_chunk = sentence_chunk
+                else:
+                    current_chunk = ""
+    
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+    
+    return chunks
 
 
 class LLMClient:
     """Base class for LLM API clients"""
     def __init__(self, api_key: str, model_name: Optional[str] = None):
         self.api_key = api_key
-        self.model_name = model_name # Specific model set by implementation
+        self.model_name = model_name  # Specific model set by implementation
+        self.input_token_limit = 0    # Will be set by subclass
+        self.output_token_limit = 0   # Will be set by subclass
 
     def generate_flashcards(self, content: str, temperature: float = 0.7, max_output_tokens: int = 4096) -> List[Dict[str, str]]:
         """Generates flashcards using the specific LLM API."""
         raise NotImplementedError
 
     def _parse_llm_response(self, response_text: str) -> List[Dict[str, str]]:
-        """Attempts to parse the LLM response text into a list of flashcard dictionaries."""
+        """Improved parser for LLM responses into flashcard dictionaries."""
+        import re
         try:
-            # Basic cleanup for markdown code blocks
-            text_to_parse = response_text.strip()
-            if text_to_parse.startswith("```json"):
-                text_to_parse = text_to_parse.split("```json", 1)[1].rsplit("```", 1)[0].strip()
-            elif text_to_parse.startswith("```"):
-                 text_to_parse = text_to_parse.split("```", 1)[1].rsplit("```", 1)[0].strip()
-
-            # Parse the JSON
-            flashcards = json.loads(text_to_parse)
-
-            # Validate structure
-            if isinstance(flashcards, list) and all(isinstance(card, dict) and 'front' in card and 'back' in card for card in flashcards):
-                # Basic content check (optional): Filter out empty cards
-                return [card for card in flashcards if card.get('front', '').strip() or card.get('back', '').strip()]
-            else:
-                raise ValueError("Parsed JSON is not a list of {'front': ..., 'back': ...} objects.")
-
-        except json.JSONDecodeError as json_e:
-            # Provide context for debugging
-            raise ValueError(f"Failed to parse JSON response. Error: {json_e}. Response text received:\n{response_text[:500]}...") from json_e
+            # Clean up potential markdown, code blocks, etc.
+            cleaned_text = response_text.strip()
+            
+            # Handle code blocks with or without language specifier
+            json_block_patterns = [
+                r"```json\s*([\s\S]*?)\s*```",  # ```json block
+                r"```\s*([\s\S]*?)\s*```",      # ``` block without language
+                r"\{[\s\S]*\}"                  # Just find JSON-like content
+            ]
+            
+            for pattern in json_block_patterns:
+                matches = re.findall(pattern, cleaned_text)
+                if matches:
+                    for potential_json in matches:
+                        try:
+                            parsed = json.loads(potential_json)
+                            if self._validate_cards_structure(parsed):
+                                return parsed
+                        except json.JSONDecodeError:
+                            continue
+            
+            # Final attempt: try parsing the whole text
+            parsed = json.loads(cleaned_text)
+            if self._validate_cards_structure(parsed):
+                return parsed
+                
+            raise ValueError("Couldn't extract valid JSON from response")
+            
         except Exception as e:
-             # Catch unexpected parsing issues
-            raise ValueError(f"An unexpected error occurred during response parsing: {e}") from e
+            raise ValueError(f"Failed to parse response: {e}") from e
+            
+    def _validate_cards_structure(self, data) -> bool:
+        """Validate the parsed JSON has the expected flashcard structure."""
+        if not isinstance(data, list):
+            return False
+            
+        # Empty list is technically valid
+        if not data:
+            return True
+            
+        # Check that all items have front/back keys
+        for item in data:
+            if not isinstance(item, dict) or 'front' not in item or 'back' not in item:
+                return False
+                
+        return True
 
 
 # --- Updated Gemini Client using new API ---
@@ -68,108 +247,274 @@ class GeminiClient(LLMClient):
         super().__init__(api_key)
         self.model_name = model_name or DEFAULT_GEMINI_MODEL
         try:
-            # Create a client instance instead of configuring globally
+            # Create a client instance
             self.client = genai.Client(api_key=self.api_key)
+            
+            # Get token limits for this model
+            self.input_token_limit, self.output_token_limit = get_model_limits(self.model_name, self.api_key)
+            
         except Exception as e:
             # Catch potential configuration errors early
             raise RuntimeError(f"Failed to initialize Google Gemini client: {e}") from e
 
     def generate_flashcards(self, content: str, temperature: float = 0.7, max_output_tokens: int = 4096) -> List[Dict[str, str]]:
-        prompt = FLASHCARD_PROMPT_TEMPLATE.format(content=content)
+        # Use the smaller of requested tokens and model limit
+        max_output_tokens = min(max_output_tokens, self.output_token_limit)
+        
+        # Calculate conservative token estimate
+        estimated_tokens = estimate_tokens_from_chars(content)
+        
+        # If content exceeds context window, chunk it
+        if estimated_tokens > self.input_token_limit * 0.75:  # 75% of limit to be safe
+            print(f"Content exceeds 75% of token limit ({estimated_tokens} vs {self.input_token_limit}), chunking...")
+            chunks = chunk_content(content, int(self.input_token_limit * 0.75))
+            all_cards = []
+            
+            # Process each chunk
+            for i, chunk in enumerate(chunks):
+                print(f"Processing chunk {i+1}/{len(chunks)} ({estimate_tokens_from_chars(chunk)} estimated tokens)")
+                chunk_prompt = FLASHCARD_PROMPT_TEMPLATE.format(content=chunk)
+                chunk_cards = self._generate_cards_for_chunk(chunk_prompt, temperature, max_output_tokens)
+                all_cards.extend(chunk_cards)
+            
+            return all_cards
+        else:
+            # Process normally for content within limits
+            prompt = FLASHCARD_PROMPT_TEMPLATE.format(content=content)
+            return self._generate_cards_for_chunk(prompt, temperature, max_output_tokens)
 
-        try:
-            # Generate content using the new API pattern
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=temperature,
-                    max_output_tokens=max_output_tokens,
-                    response_mime_type='application/json'  # Request JSON formatting
+    def _generate_cards_for_chunk(self, prompt: str, temperature: float, max_output_tokens: int) -> List[Dict[str, str]]:
+        # Add retry logic
+        max_retries = 3
+        backoff_base = 2  # seconds
+        
+        for attempt in range(max_retries):
+            try:
+                # Generate content using the API
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=temperature,
+                        max_output_tokens=max_output_tokens,
+                        response_mime_type='application/json'  # Request JSON formatting
+                    )
                 )
-            )
 
-            # Check if response is empty
-            if not response.text:
-                raise ValueError("Gemini response was empty. Check safety settings or prompt.")
+                # Check if response is empty
+                if not response.text:
+                    raise ValueError("Gemini response was empty. Check safety settings or prompt.")
 
-            response_text = response.text
-            return self._parse_llm_response(response_text)
+                response_text = response.text
+                return self._parse_llm_response(response_text)
 
-        except ValueError as e:
-            # Re-raise parsing errors
-            raise e
-        except Exception as e:
-            # Catch other unexpected errors
-            raise RuntimeError(f"An unexpected error occurred with the Google AI SDK: {e}") from e
+            except (ValueError, RuntimeError) as e:
+                # Re-raise parsing errors on final attempt
+                if attempt == max_retries - 1:
+                    raise e
+                
+                # Otherwise, retry with backoff
+                backoff_time = backoff_base ** attempt
+                print(f"API error: {e}. Retrying in {backoff_time} seconds...")
+                time.sleep(backoff_time)
+                
+            except Exception as e:
+                # Catch other unexpected errors
+                raise RuntimeError(f"An unexpected error occurred with the Google AI SDK: {e}") from e
 
 
-# --- Claude Client (Remains the same - uses requests) ---
+# --- Claude Client (with improved retry logic) ---
 class ClaudeClient(LLMClient):
     """Client for Anthropic's Claude API"""
     def __init__(self, api_key: str, model_name: Optional[str] = None):
         super().__init__(api_key)
         self.model_name = model_name or DEFAULT_CLAUDE_MODEL
         self.base_url = "https://api.anthropic.com/v1/messages"
+        
+        # Get token limits for this model
+        self.input_token_limit, self.output_token_limit = get_model_limits(self.model_name, api_key)
 
     def generate_flashcards(self, content: str, temperature: float = 0.7, max_output_tokens: int = 4096) -> List[Dict[str, str]]:
+        # Use the smaller of requested tokens and model limit
+        max_output_tokens = min(max_output_tokens, self.output_token_limit)
+        
+        # Calculate conservative token estimate
+        estimated_tokens = estimate_tokens_from_chars(content)
+        
+        # If content exceeds context window, chunk it
+        if estimated_tokens > self.input_token_limit * 0.75:  # 75% of limit to be safe
+            print(f"Content exceeds 75% of token limit ({estimated_tokens} vs {self.input_token_limit}), chunking...")
+            chunks = chunk_content(content, int(self.input_token_limit * 0.75))
+            all_cards = []
+            
+            # Process each chunk
+            for i, chunk in enumerate(chunks):
+                print(f"Processing chunk {i+1}/{len(chunks)} ({estimate_tokens_from_chars(chunk)} estimated tokens)")
+                chunk_prompt = FLASHCARD_PROMPT_TEMPLATE.format(content=chunk)
+                chunk_cards = self._generate_cards_for_chunk(chunk_prompt, temperature, max_output_tokens)
+                all_cards.extend(chunk_cards)
+            
+            return all_cards
+        else:
+            # Process normally for content within limits
+            prompt = FLASHCARD_PROMPT_TEMPLATE.format(content=content)
+            return self._generate_cards_for_chunk(prompt, temperature, max_output_tokens)
+
+    def _generate_cards_for_chunk(self, prompt: str, temperature: float, max_output_tokens: int) -> List[Dict[str, str]]:
         headers = {
             "x-api-key": self.api_key,
             "anthropic-version": "2023-06-01",
             "content-type": "application/json"
         }
-        prompt = FLASHCARD_PROMPT_TEMPLATE.format(content=content)
+        
         request_body = {
-            "model": self.model_name, "max_tokens": max_output_tokens, "temperature": temperature,
+            "model": self.model_name, 
+            "max_tokens": max_output_tokens, 
+            "temperature": temperature,
             "messages": [{"role": "user", "content": prompt}]
         }
-        try:
-            response = requests.post(self.base_url, headers=headers, json=request_body, timeout=180)
-            response.raise_for_status()
-            data = response.json()
-            if data.get("content") and isinstance(data["content"], list) and data["content"][0].get("type") == "text":
-                 response_text = data["content"][0]["text"]
-                 return self._parse_llm_response(response_text)
-            else: raise ValueError(f"Unexpected Claude response structure: {data.keys()}")
-        except requests.exceptions.HTTPError as e:
-             error_message = f"HTTP error calling Claude API ({e.response.status_code}): {e}"
-             try: error_message += f"\nResponse: {json.dumps(e.response.json(), indent=2)}"
-             except json.JSONDecodeError: error_message += f"\nResponse: {e.response.text}"
-             raise RuntimeError(error_message) from e
-        except requests.exceptions.RequestException as e: raise RuntimeError(f"Network error calling Claude API: {e}") from e
-        except Exception as e: raise RuntimeError(f"An error occurred during Claude API interaction: {e}") from e
+        
+        # Add retry logic
+        max_retries = 3
+        backoff_base = 2  # seconds
+        
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(self.base_url, headers=headers, json=request_body, timeout=180)
+                response.raise_for_status()
+                data = response.json()
+                
+                if data.get("content") and isinstance(data["content"], list) and data["content"][0].get("type") == "text":
+                    response_text = data["content"][0]["text"]
+                    return self._parse_llm_response(response_text)
+                else: 
+                    raise ValueError(f"Unexpected Claude response structure: {data.keys()}")
+                    
+            except requests.exceptions.HTTPError as e:
+                error_message = f"HTTP error calling Claude API ({e.response.status_code}): {e}"
+                try: 
+                    error_message += f"\nResponse: {json.dumps(e.response.json(), indent=2)}"
+                except json.JSONDecodeError: 
+                    error_message += f"\nResponse: {e.response.text}"
+                
+                # On final attempt, raise the error
+                if attempt == max_retries - 1:
+                    raise RuntimeError(error_message) from e
+                
+                # Otherwise, retry with backoff
+                backoff_time = backoff_base ** attempt
+                print(f"API error: {error_message}. Retrying in {backoff_time} seconds...")
+                time.sleep(backoff_time)
+                
+            except requests.exceptions.RequestException as e: 
+                # Network errors may be transient, retry
+                if attempt == max_retries - 1:
+                    raise RuntimeError(f"Network error calling Claude API: {e}") from e
+                
+                backoff_time = backoff_base ** attempt
+                print(f"Network error: {e}. Retrying in {backoff_time} seconds...")
+                time.sleep(backoff_time)
+                
+            except Exception as e: 
+                # Other errors are likely not retriable
+                raise RuntimeError(f"An error occurred during Claude API interaction: {e}") from e
 
 
-# --- OpenAI Client (Remains the same - uses requests) ---
+# --- OpenAI Client (with improved retry logic) ---
 class OpenAIClient(LLMClient):
     """Client for OpenAI's API"""
     def __init__(self, api_key: str, model_name: Optional[str] = None):
         super().__init__(api_key)
         self.model_name = model_name or DEFAULT_OPENAI_MODEL
         self.base_url = "https://api.openai.com/v1/chat/completions"
+        
+        # Get token limits for this model
+        self.input_token_limit, self.output_token_limit = get_model_limits(self.model_name, api_key)
 
     def generate_flashcards(self, content: str, temperature: float = 0.7, max_output_tokens: int = 4096) -> List[Dict[str, str]]:
+        # Use the smaller of requested tokens and model limit
+        max_output_tokens = min(max_output_tokens, self.output_token_limit)
+        
+        # Calculate conservative token estimate
+        estimated_tokens = estimate_tokens_from_chars(content)
+        
+        # If content exceeds context window, chunk it
+        if estimated_tokens > self.input_token_limit * 0.75:  # 75% of limit to be safe
+            print(f"Content exceeds 75% of token limit ({estimated_tokens} vs {self.input_token_limit}), chunking...")
+            chunks = chunk_content(content, int(self.input_token_limit * 0.75))
+            all_cards = []
+            
+            # Process each chunk
+            for i, chunk in enumerate(chunks):
+                print(f"Processing chunk {i+1}/{len(chunks)} ({estimate_tokens_from_chars(chunk)} estimated tokens)")
+                chunk_prompt = FLASHCARD_PROMPT_TEMPLATE.format(content=chunk)
+                chunk_cards = self._generate_cards_for_chunk(chunk_prompt, temperature, max_output_tokens)
+                all_cards.extend(chunk_cards)
+            
+            return all_cards
+        else:
+            # Process normally for content within limits
+            prompt = FLASHCARD_PROMPT_TEMPLATE.format(content=content)
+            return self._generate_cards_for_chunk(prompt, temperature, max_output_tokens)
+
+    def _generate_cards_for_chunk(self, prompt: str, temperature: float, max_output_tokens: int) -> List[Dict[str, str]]:
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         system_prompt = "You are an assistant that generates flashcards strictly in the specified JSON array format."
-        user_prompt = FLASHCARD_PROMPT_TEMPLATE.format(content=content)
+        
         request_body = {
-            "model": self.model_name, "temperature": temperature, "max_tokens": max_output_tokens,
-            "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+            "model": self.model_name, 
+            "temperature": temperature, 
+            "max_tokens": max_output_tokens,
+            "messages": [
+                {"role": "system", "content": system_prompt}, 
+                {"role": "user", "content": prompt}
+            ]
         }
+        
         if "gpt-4" in self.model_name or "gpt-3.5" in self.model_name:
-             request_body["response_format"] = {"type": "json_object"}
-        try:
-            response = requests.post(self.base_url, headers=headers, json=request_body, timeout=180)
-            response.raise_for_status()
-            data = response.json()
-            if data.get("choices") and data["choices"][0].get("message") and data["choices"][0]["message"].get("content"):
-                response_text = data["choices"][0]["message"]["content"]
-                return self._parse_llm_response(response_text)
-            else: raise ValueError(f"Unexpected OpenAI response structure: {data}")
-        except requests.exceptions.HTTPError as e:
-            error_message = f"HTTP error calling OpenAI API ({e.response.status_code}): {e}"
-            try: error_message += f"\nResponse: {json.dumps(e.response.json(), indent=2)}"
-            except json.JSONDecodeError: error_message += f"\nResponse: {e.response.text}"
-            raise RuntimeError(error_message) from e
-        except requests.exceptions.RequestException as e: raise RuntimeError(f"Network error calling OpenAI API: {e}") from e
-        except Exception as e: raise RuntimeError(f"An error occurred during OpenAI API interaction: {e}") from e
+            request_body["response_format"] = {"type": "json_object"}
+        
+        # Add retry logic
+        max_retries = 3
+        backoff_base = 2  # seconds
+        
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(self.base_url, headers=headers, json=request_body, timeout=180)
+                response.raise_for_status()
+                data = response.json()
+                
+                if data.get("choices") and data["choices"][0].get("message") and data["choices"][0]["message"].get("content"):
+                    response_text = data["choices"][0]["message"]["content"]
+                    return self._parse_llm_response(response_text)
+                else: 
+                    raise ValueError(f"Unexpected OpenAI response structure: {data}")
+                    
+            except requests.exceptions.HTTPError as e:
+                error_message = f"HTTP error calling OpenAI API ({e.response.status_code}): {e}"
+                try: 
+                    error_message += f"\nResponse: {json.dumps(e.response.json(), indent=2)}"
+                except json.JSONDecodeError: 
+                    error_message += f"\nResponse: {e.response.text}"
+                
+                # On final attempt, raise the error
+                if attempt == max_retries - 1:
+                    raise RuntimeError(error_message) from e
+                
+                # Otherwise, retry with backoff
+                backoff_time = backoff_base ** attempt
+                print(f"API error: {error_message}. Retrying in {backoff_time} seconds...")
+                time.sleep(backoff_time)
+                
+            except requests.exceptions.RequestException as e: 
+                # Network errors may be transient, retry
+                if attempt == max_retries - 1:
+                    raise RuntimeError(f"Network error calling OpenAI API: {e}") from e
+                
+                backoff_time = backoff_base ** attempt
+                print(f"Network error: {e}. Retrying in {backoff_time} seconds...")
+                time.sleep(backoff_time)
+                
+            except Exception as e: 
+                # Other errors are likely not retriable
+                raise RuntimeError(f"An error occurred during OpenAI API interaction: {e}") from e
