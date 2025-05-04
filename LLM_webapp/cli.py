@@ -9,7 +9,7 @@ import json
 import os 
 
 from LLM_webapp.clients import ClaudeClient, GeminiClient, OpenAIClient 
-from utils import (
+from LLM_webapp.utils import (
     extract_text_from_docx,
     extract_text_from_pptx,
     extract_text_from_pdf, 
