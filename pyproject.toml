@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "doc2deck"
+version = "0.1.0"
+authors = [
+    { name="Julius Herzog", email="juliherzog@gmail.com" }, 
+]
+description = "A tool to generate Anki decks from documents using LLMs."
+readme = "README.md" # Optional: Create a README.md file for description
+requires-python = ">=3.8" # Specify the minimum Python version
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License", # Choose an appropriate license
+    "Operating System :: OS Independent",
+    "Topic :: Utilities",
+    "Environment :: Console",
+]
+dependencies = [
+    # List all dependencies from your requirements.txt here
+    "Flask",
+    "requests",
+    "python-docx", 
+    "docx2txt", 
+    "genanki",
+    "google-genai", 
+    "python-pptx",
+    "pypdf",
+    "markdown",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/raydioactive/doc2deck" 
+
+[project.scripts]
+doc2deck = "LLM_webapp.cli:run_cli"

@@ -1,0 +1,8 @@
+Flask
+requests
+python-docx
+genanki
+google-genai  
+python-pptx
+pypdf
+markdown
