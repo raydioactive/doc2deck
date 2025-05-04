@@ -388,6 +388,42 @@ def results():
                            deck_name=current_deck_name,
                            export_format=current_export_format)
 
+@app.route('/list-models', methods=['GET', 'POST'])
+def list_models():
+    """Handles listing available models for a provider directly from APIs."""
+    from LLM_webapp.model_listing import get_available_models
+    
+    app.logger.info("Handling list-models request")
+    provider = request.args.get('provider', 'gemini')
+    models = []
+    error = None
+    
+    if request.method == 'POST':
+        provider = request.form.get('provider', 'gemini')
+        api_key = request.form.get('api_key', '').strip()
+        
+        if not api_key:
+            flash('API Key is required.', 'error')
+            app.logger.warning("API Key was missing in request.")
+            return render_template('list_models.html', provider=provider, models=[], error=None)
+        
+        try:
+            app.logger.info(f"Fetching models for provider: {provider}")
+            
+            # Fetch models directly from the API
+            models = get_available_models(provider, api_key)
+            
+            if not models:
+                flash(f'No models found for {provider} or API error occurred.', 'warning')
+            else:
+                flash(f'Found {len(models)} models for {provider}.', 'success')
+                
+        except Exception as e:
+            error = str(e)
+            app.logger.error(f"Error listing models: {e}")
+            flash(f'Error listing models: {error}', 'error')
+    
+    return render_template('list_models.html', provider=provider, models=models, error=error)
 
 # --- Function to Run the Web App ---
 def run_webapp(host='127.0.0.1', port=5000):

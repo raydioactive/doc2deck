@@ -24,13 +24,19 @@ GUIDELINES:
 2. Front side should contain a clear, specific question or cue
 3. Back side should contain a concise answer without including the question
 4. Favor applied understanding over pure memorization
-5. Include 15-30 cards depending on content density
+5. You have a token limit of {max_tokens} - produce as many high-quality cards as possible within this budget
+6. Aim for as many cards as necessary to cover all the input content or use up the token limit - whichever comes first - depending on content density, maximizing your token limit
+7. Try to keep a similar information structure across cards
 
-FORMAT:
-Output must be ONLY a JSON array of objects with "front" and "back" keys.
-Do not include any explanatory text, markdown formatting, or code block syntax.
+FORMAT REQUIREMENTS:
+- Output must be a properly formatted JSON array of objects 
+- Each object must have "front" and "back" keys in double quotes
+- All string values must be in double quotes, not single quotes
+- No trailing commas at the end of objects or arrays
+- Properly escape any special characters in strings
+- Do not include any explanatory text, markdown formatting, or code block syntax
 
-EXAMPLES OF GOOD CARDS:
+EXAMPLE OF PROPERLY FORMATTED JSON:
 [
   {{"front": "What is the principle of locality in computer systems?", "back": "The tendency of a processor to access the same set of memory locations repetitively over a short period of time, forming the basis for cache design."}},
   {{"front": "Symptoms of hyperkalemia", "back": "- Muscle weakness\\n- Paresthesia\\n- ECG changes (peaked T waves, widened QRS)\\n- Cardiac arrhythmias"}},
@@ -192,19 +198,42 @@ class LLMClient:
     def list_available_models(self) -> List[Dict[str, Any]]:
         """Lists available models for this provider."""
         raise NotImplementedError
-
-    def _parse_llm_response(self, response_text: str) -> List[Dict[str, str]]:
-        """Improved parser for LLM responses into flashcard dictionaries."""
+    def _fix_json_formatting(self, text: str) -> str:
+        """Attempt to fix common JSON formatting issues."""
         import re
+        
+        # Replace unquoted property names with quoted ones
+        text = re.sub(r'([{,]\s*)(\w+)(\s*:)', r'\1"\2"\3', text)
+        
+        # Fix trailing commas in arrays and objects
+        text = re.sub(r',(\s*[\]}])', r'\1', text)
+        
+        # Replace single quotes with double quotes (only if they're not within double-quoted strings)
+        # This is a simplistic approach that may not work for all cases
+        text = re.sub(r'\'([^\']*?)\'', r'"\1"', text)
+        
+        # Fix common escape sequence issues
+        text = text.replace('\\n', '\\\\n')
+        text = text.replace('\\t', '\\\\t')
+        
+        return text
+    def _parse_llm_response(self, response_text: str) -> List[Dict[str, str]]:
+        """Robust parser for LLM responses with improved error handling."""
+        import re
+        import json
+        
         try:
             # Clean up potential markdown, code blocks, etc.
             cleaned_text = response_text.strip()
             
-            # Handle code blocks with or without language specifier
+            # Print diagnostic info for debugging
+            print(f"Response length: {len(cleaned_text)} characters")
+            
+            # Extract JSON content from code blocks if present
+            json_content = cleaned_text
             json_block_patterns = [
                 r"```json\s*([\s\S]*?)\s*```",  # ```json block
                 r"```\s*([\s\S]*?)\s*```",      # ``` block without language
-                r"\{[\s\S]*\}"                  # Just find JSON-like content
             ]
             
             for pattern in json_block_patterns:
@@ -212,22 +241,75 @@ class LLMClient:
                 if matches:
                     for potential_json in matches:
                         try:
+                            # Try parsing directly
                             parsed = json.loads(potential_json)
                             if self._validate_cards_structure(parsed):
                                 return parsed
                         except json.JSONDecodeError:
-                            continue
+                            # Try fixing common issues
+                            fixed_json = self._fix_json_formatting(potential_json)
+                            try:
+                                parsed = json.loads(fixed_json)
+                                if self._validate_cards_structure(parsed):
+                                    print("Fixed JSON formatting issues in code block")
+                                    return parsed
+                            except json.JSONDecodeError:
+                                continue
             
-            # Final attempt: try parsing the whole text
-            parsed = json.loads(cleaned_text)
-            if self._validate_cards_structure(parsed):
-                return parsed
-                
+            # Try parsing the entire text
+            try:
+                parsed = json.loads(cleaned_text)
+                if self._validate_cards_structure(parsed):
+                    return parsed
+            except json.JSONDecodeError:
+                # Try with fixes
+                fixed_json = self._fix_json_formatting(cleaned_text)
+                try:
+                    parsed = json.loads(fixed_json)
+                    if self._validate_cards_structure(parsed):
+                        print("Fixed JSON formatting issues in full response")
+                        return parsed
+                except json.JSONDecodeError as e:
+                    print(f"Still couldn't parse after fixing: {e}")
+                    
+                    # Try fallback to ast.literal_eval which is more permissive
+                    try:
+                        import ast
+                        # Replace escaped quotes with a temporary marker
+                        temp_text = fixed_json.replace('\\"', '__QUOTE__')
+                        # Replace regular quotes with escaped quotes
+                        temp_text = temp_text.replace('"', '\\"')
+                        # Put back the originally escaped quotes
+                        temp_text = temp_text.replace('__QUOTE__', '\\"')
+                        # Wrap in quotes for literal_eval
+                        temp_text = f'"{temp_text}"'
+                        
+                        # Use literal_eval to parse
+                        parsed_string = ast.literal_eval(temp_text)
+                        # Now try to parse the string as JSON
+                        parsed = json.loads(parsed_string)
+                        if self._validate_cards_structure(parsed):
+                            print("Parsed using ast.literal_eval fallback")
+                            return parsed
+                    except (SyntaxError, ValueError, json.JSONDecodeError) as e2:
+                        print(f"ast.literal_eval fallback failed: {e2}")
+                    
+                    # Last resort: try to extract individual cards using regex
+                    try:
+                        card_pattern = r'\{\s*"front"\s*:\s*"(.+?)"\s*,\s*"back"\s*:\s*"(.+?)"\s*\}'
+                        card_matches = re.findall(card_pattern, cleaned_text, re.DOTALL)
+                        if card_matches:
+                            cards = [{"front": front, "back": back} for front, back in card_matches]
+                            print(f"Extracted {len(cards)} cards using regex")
+                            return cards
+                    except Exception as e3:
+                        print(f"Regex extraction failed: {e3}")
+            
             raise ValueError("Couldn't extract valid JSON from response")
             
         except Exception as e:
             raise ValueError(f"Failed to parse response: {e}") from e
-            
+                    
     def _validate_cards_structure(self, data) -> bool:
         """Validate the parsed JSON has the expected flashcard structure."""
         if not isinstance(data, list):
@@ -307,14 +389,23 @@ class GeminiClient(LLMClient):
             # Process each chunk
             for i, chunk in enumerate(chunks):
                 print(f"Processing chunk {i+1}/{len(chunks)} ({estimate_tokens_from_chars(chunk)} estimated tokens)")
-                chunk_prompt = FLASHCARD_PROMPT_TEMPLATE.format(content=chunk)
+                
+                # Create the prompt for this chunk, including max_tokens parameter
+                chunk_prompt = FLASHCARD_PROMPT_TEMPLATE.format(
+                    content=chunk,
+                    max_tokens=max_output_tokens
+                )
+                
                 chunk_cards = self._generate_cards_for_chunk(chunk_prompt, temperature, max_output_tokens)
                 all_cards.extend(chunk_cards)
             
             return all_cards
         else:
             # Process normally for content within limits
-            prompt = FLASHCARD_PROMPT_TEMPLATE.format(content=content)
+            prompt = FLASHCARD_PROMPT_TEMPLATE.format(
+                content=content,
+                max_tokens=max_output_tokens
+            )
             return self._generate_cards_for_chunk(prompt, temperature, max_output_tokens)
 
     def _generate_cards_for_chunk(self, prompt: str, temperature: float, max_output_tokens: int) -> List[Dict[str, str]]:
@@ -325,9 +416,10 @@ class GeminiClient(LLMClient):
         for attempt in range(max_retries):
             try:
                 # Generate content using the API
+                print(f"Generating with max_output_tokens={max_output_tokens}")
                 response = self.client.models.generate_content(
                     model=self.model_name,
-                    contents=prompt,
+                    contents=prompt,  # Prompt is already formatted with max_tokens
                     config=types.GenerateContentConfig(
                         temperature=temperature,
                         max_output_tokens=max_output_tokens,
@@ -411,14 +503,20 @@ class ClaudeClient(LLMClient):
             # Process each chunk
             for i, chunk in enumerate(chunks):
                 print(f"Processing chunk {i+1}/{len(chunks)} ({estimate_tokens_from_chars(chunk)} estimated tokens)")
-                chunk_prompt = FLASHCARD_PROMPT_TEMPLATE.format(content=chunk)
+                chunk_prompt = FLASHCARD_PROMPT_TEMPLATE.format(
+                    content=chunk,
+                    max_tokens=max_output_tokens
+                )
                 chunk_cards = self._generate_cards_for_chunk(chunk_prompt, temperature, max_output_tokens)
                 all_cards.extend(chunk_cards)
             
             return all_cards
         else:
             # Process normally for content within limits
-            prompt = FLASHCARD_PROMPT_TEMPLATE.format(content=content)
+            prompt = FLASHCARD_PROMPT_TEMPLATE.format(
+                content=content,
+                max_tokens=max_output_tokens
+            )
             return self._generate_cards_for_chunk(prompt, temperature, max_output_tokens)
 
     def _generate_cards_for_chunk(self, prompt: str, temperature: float, max_output_tokens: int) -> List[Dict[str, str]]:
@@ -548,14 +646,20 @@ class OpenAIClient(LLMClient):
             # Process each chunk
             for i, chunk in enumerate(chunks):
                 print(f"Processing chunk {i+1}/{len(chunks)} ({estimate_tokens_from_chars(chunk)} estimated tokens)")
-                chunk_prompt = FLASHCARD_PROMPT_TEMPLATE.format(content=chunk)
+                chunk_prompt = FLASHCARD_PROMPT_TEMPLATE.format(
+                    content=chunk,
+                    max_tokens=max_output_tokens
+                )
                 chunk_cards = self._generate_cards_for_chunk(chunk_prompt, temperature, max_output_tokens)
                 all_cards.extend(chunk_cards)
             
             return all_cards
         else:
             # Process normally for content within limits
-            prompt = FLASHCARD_PROMPT_TEMPLATE.format(content=content)
+            prompt = FLASHCARD_PROMPT_TEMPLATE.format(
+                content=content,
+                max_tokens=max_output_tokens
+            )
             return self._generate_cards_for_chunk(prompt, temperature, max_output_tokens)
 
     def _generate_cards_for_chunk(self, prompt: str, temperature: float, max_output_tokens: int) -> List[Dict[str, str]]:
