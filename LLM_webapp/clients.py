@@ -2,12 +2,13 @@
 import requests
 import json
 import time
+import re
 from typing import List, Dict, Optional, Tuple, Any, Mapping
 from google import genai  # Updated import for the new SDK
 from google.genai import types  # Import types from new SDK
 
 # Default models (can be overridden via constructor)
-DEFAULT_GEMINI_MODEL = "gemini-2.5-pro-latest"
+DEFAULT_GEMINI_MODEL = "gemini-1.5-pro-latest"  # Updated from 2.5-pro-latest
 DEFAULT_CLAUDE_MODEL = "claude-3-opus-20240229"
 DEFAULT_OPENAI_MODEL = "gpt-4-turbo"
 
@@ -187,6 +188,10 @@ class LLMClient:
     def generate_flashcards(self, content: str, temperature: float = 0.7, max_output_tokens: int = 4096) -> List[Dict[str, str]]:
         """Generates flashcards using the specific LLM API."""
         raise NotImplementedError
+        
+    def list_available_models(self) -> List[Dict[str, Any]]:
+        """Lists available models for this provider."""
+        raise NotImplementedError
 
     def _parse_llm_response(self, response_text: str) -> List[Dict[str, str]]:
         """Improved parser for LLM responses into flashcard dictionaries."""
@@ -245,11 +250,40 @@ class GeminiClient(LLMClient):
     """Client for Google's Gemini API using the google-generativeai SDK"""
     def __init__(self, api_key: str, model_name: Optional[str] = None):
         super().__init__(api_key)
-        self.model_name = model_name or DEFAULT_GEMINI_MODEL
-        try:
-            # Create a client instance
-            self.client = genai.Client(api_key=self.api_key)
+        self.client = genai.Client(api_key=self.api_key)
+        
+        # If model not specified, find best available model
+        if not model_name:
+            available_models = self.list_available_models()
+            # Default fallback models to try in order
+            fallback_models = [
+                "gemini-1.5-pro-latest",
+                "gemini-1.5-pro",
+                "gemini-1.5-flash-latest",
+                "gemini-1.0-pro",
+                "gemini-pro"
+            ]
             
+            model_found = False
+            available_model_names = [m['name'] for m in available_models]
+            
+            # Try each fallback model in order
+            for fallback in fallback_models:
+                for available in available_model_names:
+                    if fallback in available:
+                        model_name = available
+                        model_found = True
+                        break
+                if model_found:
+                    break
+                    
+            # If still no model, use first available
+            if not model_found and available_models:
+                model_name = available_models[0]['name']
+        
+        self.model_name = model_name or DEFAULT_GEMINI_MODEL
+        
+        try:
             # Get token limits for this model
             self.input_token_limit, self.output_token_limit = get_model_limits(self.model_name, self.api_key)
             
@@ -321,6 +355,33 @@ class GeminiClient(LLMClient):
             except Exception as e:
                 # Catch other unexpected errors
                 raise RuntimeError(f"An unexpected error occurred with the Google AI SDK: {e}") from e
+                
+    def list_available_models(self) -> List[Dict[str, Any]]:
+        """List available Gemini models."""
+        try:
+            models = []
+            for model in self.client.models.list():
+                # Filter to only include generative models (not embedding models)
+                if hasattr(model, 'supported_generation_methods') and 'generateContent' in model.supported_generation_methods:
+                    name = getattr(model, 'name', '')
+                    if name and ('gemini' in name.lower()):
+                        # Extract version and capabilities
+                        display_name = getattr(model, 'display_name', name)
+                        version = getattr(model, 'version', 'unknown')
+                        input_token_limit = getattr(model, 'input_token_limit', 0)
+                        output_token_limit = getattr(model, 'output_token_limit', 0)
+                        
+                        models.append({
+                            'name': name,
+                            'display_name': display_name,
+                            'version': version,
+                            'input_token_limit': input_token_limit,
+                            'output_token_limit': output_token_limit
+                        })
+            return models
+        except Exception as e:
+            print(f"Error listing Gemini models: {e}")
+            return []
 
 
 # --- Claude Client (with improved retry logic) ---
@@ -418,6 +479,46 @@ class ClaudeClient(LLMClient):
             except Exception as e: 
                 # Other errors are likely not retriable
                 raise RuntimeError(f"An error occurred during Claude API interaction: {e}") from e
+                
+    def list_available_models(self) -> List[Dict[str, Any]]:
+        """List available Claude models."""
+        try:
+            headers = {
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01",
+            }
+            
+            response = requests.get(
+                "https://api.anthropic.com/v1/models",
+                headers=headers,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                models = []
+                
+                for model in data.get("data", []):
+                    name = model.get("name", "")
+                    if "claude" in name.lower():
+                        models.append({
+                            "name": name,
+                            "display_name": name,
+                            "context_window": model.get("context_window", 0),
+                            "max_tokens": model.get("max_tokens_to_sample", 0)
+                        })
+                return models
+            else:
+                print(f"Error listing Claude models: HTTP {response.status_code}")
+                return []
+        except Exception as e:
+            print(f"Error listing Claude models: {e}")
+            # Fall back to hardcoded models
+            return [
+                {"name": "claude-3-opus-20240229", "display_name": "Claude 3 Opus", "context_window": 200000, "max_tokens": 4096},
+                {"name": "claude-3-sonnet-20240229", "display_name": "Claude 3 Sonnet", "context_window": 200000, "max_tokens": 4096},
+                {"name": "claude-3-haiku-20240307", "display_name": "Claude 3 Haiku", "context_window": 150000, "max_tokens": 4096}
+            ]
 
 
 # --- OpenAI Client (with improved retry logic) ---
@@ -518,3 +619,55 @@ class OpenAIClient(LLMClient):
             except Exception as e: 
                 # Other errors are likely not retriable
                 raise RuntimeError(f"An error occurred during OpenAI API interaction: {e}") from e
+                
+    def list_available_models(self) -> List[Dict[str, Any]]:
+        """List available OpenAI models."""
+        try:
+            headers = {"Authorization": f"Bearer {self.api_key}"}
+            response = requests.get(
+                "https://api.openai.com/v1/models",
+                headers=headers,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                models = []
+                
+                # Filter for chat models only
+                chat_models = []
+                for model in data.get("data", []):
+                    id = model.get("id", "")
+                    # Include only relevant models for our use case
+                    if any(prefix in id for prefix in ["gpt-4", "gpt-3.5"]) and "vision" not in id:
+                        # Parse out token limits if available
+                        context_window = 0
+                        if "gpt-4-turbo" in id or "gpt-4o" in id:
+                            context_window = 128000
+                        elif "gpt-4-32k" in id:
+                            context_window = 32768
+                        elif "gpt-4" in id:
+                            context_window = 8192
+                        elif "gpt-3.5-turbo-16k" in id:
+                            context_window = 16385
+                        elif "gpt-3.5" in id:
+                            context_window = 4096
+                            
+                        chat_models.append({
+                            "name": id,
+                            "display_name": id,
+                            "context_window": context_window
+                        })
+                
+                return chat_models
+            else:
+                print(f"Error listing OpenAI models: HTTP {response.status_code}")
+                return []
+        except Exception as e:
+            print(f"Error listing OpenAI models: {e}")
+            # Fall back to hardcoded models
+            return [
+                {"name": "gpt-4-turbo", "display_name": "GPT-4 Turbo", "context_window": 128000},
+                {"name": "gpt-4o", "display_name": "GPT-4o", "context_window": 128000},
+                {"name": "gpt-3.5-turbo", "display_name": "GPT-3.5 Turbo", "context_window": 16385}
+            ]
