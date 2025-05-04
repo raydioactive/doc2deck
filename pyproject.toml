@@ -10,7 +10,7 @@ authors = [
 ]
 description = "A tool to generate Anki decks from documents using LLMs."
 readme = "README.md" # Optional: Create a README.md file for description
-requires-python = ">=3.8" # Specify the minimum Python version
+requires-python = ">=3.11" # Specify the minimum Python version
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License", # Choose an appropriate license
@@ -19,7 +19,6 @@ classifiers = [
     "Environment :: Console",
 ]
 dependencies = [
-    # List all dependencies from your requirements.txt here
     "Flask",
     "requests",
     "python-docx", 

@@ -4,7 +4,6 @@ import json
 from typing import List, Dict, Optional
 from google import genai  # Updated import for the new SDK
 from google.genai import types  # Import types from new SDK
-from google.api_core import exceptions as google_exceptions  # Import SDK exceptions
 
 # Default models (can be overridden via constructor)
 DEFAULT_GEMINI_MODEL = "gemini-2.5-pro-latest"
@@ -97,12 +96,6 @@ class GeminiClient(LLMClient):
             response_text = response.text
             return self._parse_llm_response(response_text)
 
-        except google_exceptions.GoogleAPIError as e:
-            # Handle API errors
-            error_message = f"Google AI SDK API error: {e}"
-            if hasattr(e, 'message'): 
-                error_message += f" Details: {e.message}"
-            raise RuntimeError(error_message) from e
         except ValueError as e:
             # Re-raise parsing errors
             raise e
